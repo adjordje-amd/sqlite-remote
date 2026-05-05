@@ -124,19 +124,27 @@ static int query_remote_schema(remote_vtab *v, char **errmsg)
 
 static int query_remote_schema_raw(remote_vtab *v, char **errmsg)
 {
-    char *wrapped = sqlite3_mprintf("SELECT * FROM (%s) LIMIT 1", v->raw_sql);
+    /* Schema discovery for raw query mode. We can't rely on `sqlite3 -header`
+     * because it suppresses headers when the result has zero rows (e.g. an
+     * INNER JOIN that legitimately matches nothing). Materialize the query
+     * into a temp table and read column names from pragma_table_info -
+     * works regardless of result size. */
+    char *wrapped = sqlite3_mprintf(
+        "CREATE TEMP TABLE __sd AS %s LIMIT 0; "
+        "SELECT GROUP_CONCAT(name, char(9)) FROM pragma_table_info('__sd')",
+        v->raw_sql);
     if (!wrapped) return SQLITE_NOMEM;
 
     char *cmd;
     if (v->password && v->password[0])
         cmd = sqlite3_mprintf(
             "sshpass -p '%q' ssh " SSH_MUX_OPTS " %s "
-            "\"sqlite3 -header -separator $'\\t' %s '%q'\" 2>&1",
+            "\"sqlite3 -separator $'\\t' %s '%q'\" 2>&1",
             v->password, v->host, v->db_path, wrapped);
     else
         cmd = sqlite3_mprintf(
             "ssh " SSH_MUX_OPTS " %s "
-            "\"sqlite3 -header -separator $'\\t' %s '%q'\" 2>&1",
+            "\"sqlite3 -separator $'\\t' %s '%q'\" 2>&1",
             v->host, v->db_path, wrapped);
     sqlite3_free(wrapped);
     if (!cmd) return SQLITE_NOMEM;
