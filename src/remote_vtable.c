@@ -244,11 +244,13 @@ static int remote_connect(sqlite3 *db, void *aux, int argc,
     if (rc != SQLITE_OK) goto fail;
 
     {
+        /* Quote column names with double quotes so non-identifier names like
+         * "COUNT(*)", aliased aggregates, expressions etc. are accepted. */
         char *ddl = sqlite3_mprintf("CREATE TABLE x(");
         for (int i = 0; i < v->num_cols; i++) {
             char *tmp = (i == 0)
-                ? sqlite3_mprintf("%s%s TEXT", ddl, v->col_names[i])
-                : sqlite3_mprintf("%s, %s TEXT", ddl, v->col_names[i]);
+                ? sqlite3_mprintf("%s\"%w\" TEXT", ddl, v->col_names[i])
+                : sqlite3_mprintf("%s, \"%w\" TEXT", ddl, v->col_names[i]);
             sqlite3_free(ddl);
             ddl = tmp;
         }
