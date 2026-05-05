@@ -5,9 +5,9 @@ SQLITE_EXTENSION_INIT1
 #include <stdlib.h>
 #include <string.h>
 
-#define MAX_COLS 10
-#define MAX_LINE 8192
-#define MAX_ROWS 4096
+#define MAX_COLS 32
+#define MAX_LINE 16384
+#define MAX_ROWS 131072
 
 typedef struct {
     sqlite3_vtab      base;
@@ -15,6 +15,8 @@ typedef struct {
     char             *db_path;
     char             *password;
     char             *table_name;
+    char             *raw_sql;
+    int               is_raw_query;
     int               num_cols;
     char             *col_names[MAX_COLS];
     int               row_count;
@@ -30,9 +32,9 @@ typedef struct {
 
 static char *build_ssh_cmd(remote_vtab *v, const char *remote_sql)
 {
-    if (v->password)
+    if (v->password && v->password[0])
         return sqlite3_mprintf(
-            "sshpass -p %s ssh %s \"sqlite3 -separator $'\\t' %s '%q'\" 2>&1",
+            "sshpass -p '%q' ssh %s \"sqlite3 -separator $'\\t' %s '%q'\" 2>&1",
             v->password, v->host, v->db_path, remote_sql);
 
     return sqlite3_mprintf(
@@ -109,6 +111,53 @@ static int query_remote_schema(remote_vtab *v, char **errmsg)
     return SQLITE_OK;
 }
 
+static int query_remote_schema_raw(remote_vtab *v, char **errmsg)
+{
+    char *wrapped = sqlite3_mprintf("SELECT * FROM (%s) LIMIT 1", v->raw_sql);
+    if (!wrapped) return SQLITE_NOMEM;
+
+    char *cmd;
+    if (v->password && v->password[0])
+        cmd = sqlite3_mprintf(
+            "sshpass -p '%q' ssh %s \"sqlite3 -header -separator $'\\t' %s '%q'\" 2>&1",
+            v->password, v->host, v->db_path, wrapped);
+    else
+        cmd = sqlite3_mprintf(
+            "ssh %s \"sqlite3 -header -separator $'\\t' %s '%q'\" 2>&1",
+            v->host, v->db_path, wrapped);
+    sqlite3_free(wrapped);
+    if (!cmd) return SQLITE_NOMEM;
+
+    FILE *fp = popen(cmd, "r");
+    sqlite3_free(cmd);
+    if (!fp) {
+        *errmsg = sqlite3_mprintf("failed to query remote schema for raw query");
+        return SQLITE_ERROR;
+    }
+
+    char line[MAX_LINE];
+    v->num_cols = 0;
+    if (fgets(line, sizeof(line), fp)) {
+        size_t len = strlen(line);
+        if (len > 0 && line[len - 1] == '\n') line[len - 1] = '\0';
+
+        char *saveptr = NULL;
+        char *tok = strtok_r(line, "\t", &saveptr);
+        while (tok && v->num_cols < MAX_COLS) {
+            v->col_names[v->num_cols++] = sqlite3_mprintf("%s", tok);
+            tok = strtok_r(NULL, "\t", &saveptr);
+        }
+    }
+
+    int status = pclose(fp);
+    if (v->num_cols == 0) {
+        *errmsg = sqlite3_mprintf(
+            "no columns returned by raw query (exit %d)", status);
+        return SQLITE_ERROR;
+    }
+    return SQLITE_OK;
+}
+
 static void vtab_free_rows(remote_vtab *v)
 {
     for (int r = 0; r < v->row_count; r++)
@@ -135,16 +184,15 @@ static int remote_connect(sqlite3 *db, void *aux, int argc,
     if (!v) return SQLITE_NOMEM;
     memset(v, 0, sizeof(*v));
 
-    v->host       = sqlite3_mprintf("%s", argv[3]);
-    v->db_path    = sqlite3_mprintf("%s", argv[4]);
-    v->password   = (argc > 5) ? sqlite3_mprintf("%s", argv[5]) : NULL;
-    v->table_name = (argc > 6)
-        ? sqlite3_mprintf("%s", argv[6])
-        : sqlite3_mprintf("%s", argv[2]);
+    v->host     = sqlite3_mprintf("%s", argv[3]);
+    v->db_path  = sqlite3_mprintf("%s", argv[4]);
+    v->password = (argc > 5) ? sqlite3_mprintf("%s", argv[5]) : NULL;
+
+    const char *fourth_arg = (argc > 6) ? argv[6] : argv[2];
 
     /* strip surrounding quotes from arguments */
-    char **fields[] = { &v->host, &v->db_path, &v->password, &v->table_name };
-    for (int i = 0; i < 4; i++) {
+    char **fields[] = { &v->host, &v->db_path, &v->password };
+    for (int i = 0; i < 3; i++) {
         if (!fields[i] || !*fields[i]) continue;
         char *s = *fields[i];
         size_t len = strlen(s);
@@ -155,7 +203,31 @@ static int remote_connect(sqlite3 *db, void *aux, int argc,
         }
     }
 
-    int rc = query_remote_schema(v, errmsg);
+    /* detect raw query mode: 4th arg starts with SELECT (case-insensitive) */
+    char *unquoted_fourth = sqlite3_mprintf("%s", fourth_arg);
+    if (unquoted_fourth) {
+        size_t len = strlen(unquoted_fourth);
+        if (len >= 2 && ((unquoted_fourth[0] == '"' && unquoted_fourth[len-1] == '"') ||
+                         (unquoted_fourth[0] == '\'' && unquoted_fourth[len-1] == '\''))) {
+            memmove(unquoted_fourth, unquoted_fourth + 1, len - 2);
+            unquoted_fourth[len - 2] = '\0';
+        }
+    }
+
+    int rc;
+    if (unquoted_fourth &&
+        (strncmp(unquoted_fourth, "SELECT", 6) == 0 ||
+         strncmp(unquoted_fourth, "select", 6) == 0)) {
+        v->is_raw_query = 1;
+        v->raw_sql      = unquoted_fourth;
+        v->table_name   = NULL;
+        rc = query_remote_schema_raw(v, errmsg);
+    } else {
+        v->is_raw_query = 0;
+        v->raw_sql      = NULL;
+        v->table_name   = unquoted_fourth;
+        rc = query_remote_schema(v, errmsg);
+    }
     if (rc != SQLITE_OK) goto fail;
 
     {
@@ -181,6 +253,7 @@ fail:
     for (int i = 0; i < v->num_cols; i++)
         sqlite3_free(v->col_names[i]);
     sqlite3_free(v->table_name);
+    sqlite3_free(v->raw_sql);
     sqlite3_free(v->host);
     sqlite3_free(v->db_path);
     sqlite3_free(v->password);
@@ -195,6 +268,7 @@ static int remote_disconnect(sqlite3_vtab *vtab)
     for (int i = 0; i < v->num_cols; i++)
         sqlite3_free(v->col_names[i]);
     sqlite3_free(v->table_name);
+    sqlite3_free(v->raw_sql);
     sqlite3_free(v->host);
     sqlite3_free(v->db_path);
     sqlite3_free(v->password);
@@ -223,6 +297,28 @@ static int remote_close(sqlite3_vtab_cursor *cursor)
 {
     sqlite3_free(cursor);
     return SQLITE_OK;
+}
+
+static int parse_row_raw(remote_vtab *v, const char *line, int row)
+{
+    char buf[MAX_LINE];
+    strncpy(buf, line, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    size_t len = strlen(buf);
+    if (len > 0 && buf[len - 1] == '\n') buf[len - 1] = '\0';
+
+    v->remote_rowids[row] = row;
+
+    char *saveptr = NULL;
+    char *tok = strtok_r(buf, "\t", &saveptr);
+    int col = 0;
+    while (tok && col < MAX_COLS) {
+        v->rows[row][col] = sqlite3_mprintf("%s", tok);
+        col++;
+        tok = strtok_r(NULL, "\t", &saveptr);
+    }
+    return col;
 }
 
 static int parse_row(remote_vtab *v, const char *line, int row)
@@ -264,7 +360,12 @@ static int remote_filter(sqlite3_vtab_cursor *cursor, int idx_num,
 
     vtab_free_rows(v);
 
-    char *sql = sqlite3_mprintf("SELECT rowid, * FROM %s", v->table_name);
+    char *sql;
+    if (v->is_raw_query)
+        sql = sqlite3_mprintf("%s", v->raw_sql);
+    else
+        sql = sqlite3_mprintf("SELECT rowid, * FROM %s", v->table_name);
+
     char *cmd = build_ssh_cmd(v, sql);
     sqlite3_free(sql);
     if (!cmd) return SQLITE_NOMEM;
@@ -278,7 +379,9 @@ static int remote_filter(sqlite3_vtab_cursor *cursor, int idx_num,
 
     char line[MAX_LINE];
     while (fgets(line, sizeof(line), fp) && v->row_count < MAX_ROWS) {
-        int cols = parse_row(v, line, v->row_count);
+        int cols = v->is_raw_query
+            ? parse_row_raw(v, line, v->row_count)
+            : parse_row(v, line, v->row_count);
         if (v->row_count == 0)
             v->data_cols = cols;
         v->row_count++;
@@ -345,6 +448,13 @@ static int remote_update(sqlite3_vtab *vtab, int argc,
                          sqlite3_value **argv, sqlite3_int64 *rowid)
 {
     remote_vtab *v = (remote_vtab *)vtab;
+
+    if (v->is_raw_query) {
+        v->base.zErrMsg = sqlite3_mprintf(
+            "raw query virtual tables are read-only");
+        return SQLITE_READONLY;
+    }
+
     char *sql = NULL;
 
     if (argc == 1) {
