@@ -132,10 +132,15 @@ static int query_remote_schema_raw(remote_vtab *v, char **errmsg)
      * sees the contradiction and skips the inner SELECT evaluation entirely.
      * Column names + types come from the projection. Then read names from
      * pragma_table_info. Critical for heavy JOINs/aggregates - LIMIT 0 may
-     * still evaluate the inner. */
+     * still evaluate the inner.
+     *
+     * The temp table name is referenced via char(95,95,115,100) = '__sd'
+     * because the SQL is shell-quoted with '' inside ssh args; '__sd'
+     * literal would be split by the shell ('' = empty string) and SQLite
+     * would see pragma_table_info(__sd) - bare identifier, no such column. */
     char *wrapped = sqlite3_mprintf(
         "CREATE TEMP TABLE __sd AS SELECT * FROM (%s) WHERE 0; "
-        "SELECT GROUP_CONCAT(name, char(9)) FROM pragma_table_info('__sd')",
+        "SELECT GROUP_CONCAT(name, char(9)) FROM pragma_table_info(char(95,95,115,100))",
         v->raw_sql);
     if (!wrapped) return SQLITE_NOMEM;
 
