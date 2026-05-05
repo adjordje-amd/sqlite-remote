@@ -126,11 +126,15 @@ static int query_remote_schema_raw(remote_vtab *v, char **errmsg)
 {
     /* Schema discovery for raw query mode. We can't rely on `sqlite3 -header`
      * because it suppresses headers when the result has zero rows (e.g. an
-     * INNER JOIN that legitimately matches nothing). Materialize the query
-     * into a temp table and read column names from pragma_table_info -
-     * works regardless of result size. */
+     * INNER JOIN that legitimately matches nothing).
+     *
+     * Materialize ONLY THE SCHEMA via `WHERE 0` short-circuit - the planner
+     * sees the contradiction and skips the inner SELECT evaluation entirely.
+     * Column names + types come from the projection. Then read names from
+     * pragma_table_info. Critical for heavy JOINs/aggregates - LIMIT 0 may
+     * still evaluate the inner. */
     char *wrapped = sqlite3_mprintf(
-        "CREATE TEMP TABLE __sd AS %s LIMIT 0; "
+        "CREATE TEMP TABLE __sd AS SELECT * FROM (%s) WHERE 0; "
         "SELECT GROUP_CONCAT(name, char(9)) FROM pragma_table_info('__sd')",
         v->raw_sql);
     if (!wrapped) return SQLITE_NOMEM;
