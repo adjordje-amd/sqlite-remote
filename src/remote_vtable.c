@@ -30,15 +30,26 @@ typedef struct {
     int                 current_row;
 } remote_cursor;
 
+/* SSH ControlMaster opts: first call sets up a TCP master, subsequent
+ * calls reuse it (no fresh handshake). Cuts per-call latency from
+ * ~370ms to ~10ms after the master is up. ControlPath is keyed by
+ * connection 4-tuple (%C is a hash of host:port:user:lhost). */
+#define SSH_MUX_OPTS \
+    "-o ControlMaster=auto " \
+    "-o ControlPath=~/.ssh/cm-%%C " \
+    "-o ControlPersist=10m"
+
 static char *build_ssh_cmd(remote_vtab *v, const char *remote_sql)
 {
     if (v->password && v->password[0])
         return sqlite3_mprintf(
-            "sshpass -p '%q' ssh %s \"sqlite3 -separator $'\\t' %s '%q'\" 2>&1",
+            "sshpass -p '%q' ssh " SSH_MUX_OPTS " %s "
+            "\"sqlite3 -separator $'\\t' %s '%q'\" 2>&1",
             v->password, v->host, v->db_path, remote_sql);
 
     return sqlite3_mprintf(
-        "ssh %s \"sqlite3 -separator $'\\t' %s '%q'\" 2>&1",
+        "ssh " SSH_MUX_OPTS " %s "
+        "\"sqlite3 -separator $'\\t' %s '%q'\" 2>&1",
         v->host, v->db_path, remote_sql);
 }
 
@@ -119,11 +130,13 @@ static int query_remote_schema_raw(remote_vtab *v, char **errmsg)
     char *cmd;
     if (v->password && v->password[0])
         cmd = sqlite3_mprintf(
-            "sshpass -p '%q' ssh %s \"sqlite3 -header -separator $'\\t' %s '%q'\" 2>&1",
+            "sshpass -p '%q' ssh " SSH_MUX_OPTS " %s "
+            "\"sqlite3 -header -separator $'\\t' %s '%q'\" 2>&1",
             v->password, v->host, v->db_path, wrapped);
     else
         cmd = sqlite3_mprintf(
-            "ssh %s \"sqlite3 -header -separator $'\\t' %s '%q'\" 2>&1",
+            "ssh " SSH_MUX_OPTS " %s "
+            "\"sqlite3 -header -separator $'\\t' %s '%q'\" 2>&1",
             v->host, v->db_path, wrapped);
     sqlite3_free(wrapped);
     if (!cmd) return SQLITE_NOMEM;
